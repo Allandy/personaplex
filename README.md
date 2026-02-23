@@ -66,6 +66,9 @@ Access the Web UI from a browser at `localhost:8998` if running locally, otherwi
 Access the Web UI directly at https://11.54.401.33:8998
 ```
 
+If `client/dist` exists in this repo, the server will serve that local bundle by default.  
+If it is missing, the server falls back to downloading `dist.tgz` from Hugging Face.
+
 ### Lead Forwarding Endpoint
 The server now exposes `POST /api/lead` for sending qualified lead payloads (contact + transcript) to contractor destinations.
 

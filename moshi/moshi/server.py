@@ -494,7 +494,12 @@ def _get_voice_prompt_dir(voice_prompt_dir: Optional[str], hf_repo: str) -> Opti
 
 def _get_static_path(static: Optional[str]) -> Optional[str]:
     if static is None:
-        logger.info("retrieving the static content")
+        local_dist = Path(__file__).resolve().parents[2] / "client" / "dist"
+        if local_dist.exists():
+            logger.info(f"using local static content from {local_dist}")
+            return str(local_dist)
+
+        logger.info("retrieving static content from Hugging Face")
         dist_tgz = hf_hub_download("nvidia/personaplex-7b-v1", "dist.tgz")
         dist_tgz = Path(dist_tgz)
         dist = dist_tgz.parent / "dist"

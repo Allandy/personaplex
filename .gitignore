@@ -180,6 +180,10 @@ client/node_modules
 timings.json
 mlx-trace.json
 
+# allow checked-in frontend production bundle
+!client/dist/
+!client/dist/**
+
 # Include everything in assets
 !assets/
 !assets/**
