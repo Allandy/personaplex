@@ -29,12 +29,14 @@ import asyncio
 from dataclasses import dataclass
 import random
 import os
+import json
 from pathlib import Path
 import tarfile
 import time
 import secrets
 import sys
-from typing import Literal, Optional
+import uuid
+from typing import Any, Literal, Optional
 
 import aiohttp
 from aiohttp import web
@@ -43,9 +45,7 @@ import numpy as np
 import sentencepiece
 import sphn
 import torch
-import random
 
-from .client_utils import make_log, colorize
 from .models import loaders, MimiModel, LMModel, LMGen
 from .utils.connection import create_ssl_context, get_lan_ip
 from .utils.logging import setup_logger, ColorizedLog
@@ -86,6 +86,29 @@ def wrap_with_system_tags(text: str) -> str:
     return f"<system> {cleaned} <system>"
 
 
+def is_valid_email(value: str) -> bool:
+    if "@" not in value:
+        return False
+    local, _, domain = value.partition("@")
+    if not local or "." not in domain:
+        return False
+    return True
+
+
+def normalize_mobile(value: str) -> str:
+    return "".join(ch for ch in value if ch.isdigit() or ch == "+")
+
+
+def is_valid_mobile(value: str) -> bool:
+    if not value:
+        return False
+    if value[0] == "+":
+        digits = value[1:]
+    else:
+        digits = value
+    return digits.isdigit() and 8 <= len(digits) <= 15
+
+
 @dataclass
 class ServerState:
     mimi: MimiModel
@@ -96,12 +119,20 @@ class ServerState:
 
     def __init__(self, mimi: MimiModel, other_mimi: MimiModel, text_tokenizer: sentencepiece.SentencePieceProcessor,
                  lm: LMModel, device: str | torch.device, voice_prompt_dir: str | None = None,
-                 save_voice_prompt_embeddings: bool = False):
+                 save_voice_prompt_embeddings: bool = False,
+                 max_text_prompt_tokens: int = 200,
+                 lead_destinations: Optional[dict[str, dict[str, str]]] = None,
+                 lead_log_path: Optional[str] = None,
+                 lead_forward_timeout_sec: float = 8.0):
         self.mimi = mimi
         self.other_mimi = other_mimi
         self.text_tokenizer = text_tokenizer
         self.device = device
         self.voice_prompt_dir = voice_prompt_dir
+        self.max_text_prompt_tokens = max(0, max_text_prompt_tokens)
+        self.lead_destinations = lead_destinations or {}
+        self.lead_log_path = lead_log_path
+        self.lead_forward_timeout_sec = lead_forward_timeout_sec
         self.frame_size = int(self.mimi.sample_rate / self.mimi.frame_rate)
         self.lm_gen = LMGen(lm,
                             audio_silence_frame_cnt=int(0.5 * self.mimi.frame_rate),
@@ -167,8 +198,21 @@ class ServerState:
                 self.lm_gen.load_voice_prompt_embeddings(voice_prompt_path)
             else:
                 self.lm_gen.load_voice_prompt(voice_prompt_path)
-        self.lm_gen.text_prompt_tokens = self.text_tokenizer.encode(wrap_with_system_tags(request.query["text_prompt"])) if len(request.query["text_prompt"]) > 0 else None
-        seed = int(request["seed"]) if "seed" in request.query else None
+
+        text_prompt = request.query["text_prompt"]
+        if len(text_prompt) > 0:
+            encoded_prompt = self.text_tokenizer.encode(wrap_with_system_tags(text_prompt))
+            if self.max_text_prompt_tokens > 0 and len(encoded_prompt) > self.max_text_prompt_tokens:
+                clog.log(
+                    "warning",
+                    f"text prompt exceeded token budget and was truncated "
+                    f"({len(encoded_prompt)} -> {self.max_text_prompt_tokens})",
+                )
+                encoded_prompt = encoded_prompt[:self.max_text_prompt_tokens]
+            self.lm_gen.text_prompt_tokens = encoded_prompt
+        else:
+            self.lm_gen.text_prompt_tokens = None
+        seed = int(request.query["seed"]) if "seed" in request.query else None
 
         async def recv_loop():
             nonlocal close
@@ -308,6 +352,116 @@ class ServerState:
         clog.log("info", "done with connection")
         return ws
 
+    def _is_qualified_lead(self, transcript: str) -> bool:
+        normalized = transcript.lower()
+        if len(normalized.strip()) < 80:
+            return False
+        keywords = (
+            "deck",
+            "quote",
+            "estimate",
+            "repair",
+            "replace",
+            "composite",
+            "wood",
+            "timeline",
+            "budget",
+        )
+        return any(keyword in normalized for keyword in keywords)
+
+    def _append_lead_log(self, lead_payload: dict[str, Any]) -> None:
+        if not self.lead_log_path:
+            return
+        log_path = Path(self.lead_log_path)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as fp:
+            fp.write(json.dumps(lead_payload) + "\n")
+
+    async def _forward_lead(self, lead_payload: dict[str, Any], destination: dict[str, str]) -> None:
+        webhook_url = destination.get("webhook_url")
+        if not webhook_url:
+            raise RuntimeError("No webhook_url configured for contractor destination.")
+
+        timeout = aiohttp.ClientTimeout(total=self.lead_forward_timeout_sec)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(webhook_url, json=lead_payload) as response:
+                if response.status >= 400:
+                    body = await response.text()
+                    raise RuntimeError(
+                        f"Lead forward failed with status={response.status}, body={body[:500]}"
+                    )
+
+    async def handle_lead(self, request: web.Request) -> web.Response:
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({"error": "Invalid JSON body."}, status=400)
+
+        if not isinstance(payload, dict):
+            return web.json_response({"error": "Body must be a JSON object."}, status=400)
+
+        contractor_id = str(payload.get("contractor_id", "")).strip()
+        contact_type = str(payload.get("contact_type", "")).strip().lower()
+        contact_value = str(payload.get("contact_value", "")).strip()
+        transcript = str(payload.get("transcript", "")).strip()
+        session_meta = payload.get("session_meta", {})
+
+        if not contractor_id:
+            return web.json_response({"error": "contractor_id is required."}, status=400)
+        if contact_type not in ("email", "mobile"):
+            return web.json_response({"error": "contact_type must be either 'email' or 'mobile'."}, status=400)
+        if not contact_value:
+            return web.json_response({"error": "contact_value is required."}, status=400)
+        if not isinstance(session_meta, dict):
+            return web.json_response({"error": "session_meta must be an object."}, status=400)
+        if not transcript:
+            transcript = "[Transcript unavailable: no model text output captured.]"
+        if len(transcript) > 40000:
+            transcript = transcript[:40000]
+
+        if contact_type == "email":
+            if not is_valid_email(contact_value):
+                return web.json_response({"error": "Invalid email contact_value."}, status=400)
+        else:
+            contact_value = normalize_mobile(contact_value)
+            if not is_valid_mobile(contact_value):
+                return web.json_response({"error": "Invalid mobile contact_value."}, status=400)
+
+        destination = self.lead_destinations.get(contractor_id) or self.lead_destinations.get("default")
+        if destination is None:
+            return web.json_response(
+                {"error": f"No lead destination configured for contractor_id '{contractor_id}'."},
+                status=500,
+            )
+
+        lead_id = uuid.uuid4().hex
+        created_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        qualified = self._is_qualified_lead(transcript)
+
+        lead_payload = {
+            "lead_id": lead_id,
+            "created_at": created_at,
+            "contractor_id": contractor_id,
+            "contact_type": contact_type,
+            "contact_value": contact_value,
+            "qualified": qualified,
+            "transcript": transcript,
+            "session_meta": session_meta,
+            "destination": {
+                "notify_email": destination.get("notify_email"),
+                "label": destination.get("label"),
+            },
+        }
+
+        try:
+            self._append_lead_log(lead_payload)
+            await self._forward_lead(lead_payload, destination)
+        except Exception as exc:
+            logger.exception("Lead forwarding failed")
+            return web.json_response({"error": f"Lead forwarding failed: {exc}"}, status=502)
+
+        return web.json_response({"ok": True, "lead_id": lead_id, "qualified": qualified})
+
 
 def _get_voice_prompt_dir(voice_prompt_dir: Optional[str], hf_repo: str) -> Optional[str]:
     """
@@ -354,6 +508,32 @@ def _get_static_path(static: Optional[str]) -> Optional[str]:
     return None
 
 
+def _parse_lead_destinations(raw: Optional[str]) -> dict[str, dict[str, str]]:
+    if raw is None or raw.strip() == "":
+        return {}
+
+    parsed = json.loads(raw)
+    if not isinstance(parsed, dict):
+        raise ValueError("Lead destinations config must be a JSON object.")
+
+    destinations: dict[str, dict[str, str]] = {}
+    for contractor_id, value in parsed.items():
+        if not isinstance(contractor_id, str):
+            continue
+        if isinstance(value, str):
+            destinations[contractor_id] = {"webhook_url": value}
+            continue
+        if isinstance(value, dict):
+            destination: dict[str, str] = {}
+            for key in ("webhook_url", "notify_email", "label"):
+                current = value.get(key)
+                if isinstance(current, str) and current.strip():
+                    destination[key] = current.strip()
+            if destination:
+                destinations[contractor_id] = destination
+    return destinations
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="localhost", type=str)
@@ -390,6 +570,33 @@ def main():
             "that contains valid key.pem and cert.pem files"
         )
     )
+    parser.add_argument(
+        "--max-text-prompt-tokens",
+        type=int,
+        default=200,
+        help="Maximum number of prompt tokens to keep after tokenization.",
+    )
+    parser.add_argument(
+        "--lead-destinations-json",
+        type=str,
+        default=os.getenv("PERSONAPLEX_LEAD_DESTINATIONS"),
+        help=(
+            "JSON object mapping contractor_id to destination config. "
+            "Example: '{\"decking_north\":{\"webhook_url\":\"https://example.com/webhook\"}}'"
+        ),
+    )
+    parser.add_argument(
+        "--lead-log-path",
+        type=str,
+        default=os.getenv("PERSONAPLEX_LEAD_LOG_PATH", "personaplex_leads.jsonl"),
+        help="Path for append-only lead logs. Set to empty string to disable local lead logging.",
+    )
+    parser.add_argument(
+        "--lead-forward-timeout",
+        type=float,
+        default=8.0,
+        help="Timeout in seconds for forwarding leads to webhook destinations.",
+    )
 
     args = parser.parse_args()
     args.voice_prompt_dir = _get_voice_prompt_dir(
@@ -406,6 +613,15 @@ def main():
         f"Static path does not exist: {static_path}."
     logger.info(f"static_path = {static_path}")
     args.device = torch_auto_device(args.device)
+
+    try:
+        lead_destinations = _parse_lead_destinations(args.lead_destinations_json)
+    except Exception as exc:
+        raise RuntimeError(f"Invalid lead destination configuration: {exc}") from exc
+    logger.info(f"lead_destinations configured for: {list(lead_destinations.keys())}")
+    lead_log_path = args.lead_log_path.strip() if args.lead_log_path is not None else ""
+    if lead_log_path == "":
+        lead_log_path = None
 
     seed_all(42424242)
 
@@ -453,11 +669,16 @@ def main():
         device=args.device,
         voice_prompt_dir=args.voice_prompt_dir,
         save_voice_prompt_embeddings=False,
+        max_text_prompt_tokens=args.max_text_prompt_tokens,
+        lead_destinations=lead_destinations,
+        lead_log_path=lead_log_path,
+        lead_forward_timeout_sec=args.lead_forward_timeout,
     )
     logger.info("warming up the model")
     state.warmup()
     app = web.Application()
     app.router.add_get("/api/chat", state.handle_chat)
+    app.router.add_post("/api/lead", state.handle_lead)
     if static_path is not None:
         async def handle_root(_):
             return web.FileResponse(os.path.join(static_path, "index.html"))

@@ -15,6 +15,18 @@ Frontend for the demo.
 To skip the queue for standalone use, once the project is running go to `/?worker_addr={WORKER_ADDR}` where `WORKER_ADDR` is your worker instance address.
 For example : `https://localhost:5173/?worker_addr=0.0.0.0:8088`
 
+## Iframe Embed Mode
+Use iframe mode for a simplified contractor intake flow:
+
+- URL: `/?embed=1&contractor_id=decking_north&worker_addr={WORKER_ADDR}`
+- `embed=1` hides advanced controls and shows a single **Connect** entry point.
+- `contractor_id` applies a preconfigured contractor prompt and voice preset.
+
+The iframe host page must allow microphone access:
+```html
+<iframe src=\"https://your-host/?embed=1&contractor_id=decking_north\" allow=\"microphone\"></iframe>
+```
+
 ## License
 
 The present code is provided under the MIT license.

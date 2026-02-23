@@ -19,3 +19,12 @@ export const validateCheckUser = (response: unknown) => {
   });
   return CheckUser.safeParse(response);
 }
+
+export const validateLeadSubmission = (response: unknown) => {
+  const LeadSubmission = z.object({
+    ok: z.literal(true),
+    qualified: z.boolean(),
+    lead_id: z.string(),
+  });
+  return LeadSubmission.safeParse(response);
+};

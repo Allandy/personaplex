@@ -1,5 +1,5 @@
 import moshiProcessorUrl from "../../audio-processor.ts?worker&url";
-import { FC, useEffect, useState, useCallback, useRef, MutableRefObject } from "react";
+import { FC, useEffect, useState, useCallback, useRef, MutableRefObject, useMemo } from "react";
 import eruda from "eruda";
 import { useSearchParams } from "react-router-dom";
 import { Conversation } from "../Conversation/Conversation";
@@ -7,6 +7,7 @@ import { Button } from "../../components/Button/Button";
 import { useModelParams } from "../Conversation/hooks/useModelParams";
 import { env } from "../../env";
 import { prewarmDecoderWorker } from "../../decoder/decoderWorker";
+import { getContractorPreset } from "../../config/contractorPresets";
 
 const VOICE_OPTIONS = [
   "NATF0.pt", "NATF1.pt", "NATF2.pt", "NATF3.pt",
@@ -41,6 +42,8 @@ interface HomepageProps {
   setTextPrompt: (value: string) => void;
   voicePrompt: string;
   setVoicePrompt: (value: string) => void;
+  isEmbed: boolean;
+  presetLabel: string;
 }
 
 const Homepage = ({
@@ -50,7 +53,30 @@ const Homepage = ({
   setTextPrompt,
   voicePrompt,
   setVoicePrompt,
+  isEmbed,
+  presetLabel,
 }: HomepageProps) => {
+  if (isEmbed) {
+    return (
+      <div className="h-screen w-screen p-4 flex items-center justify-center bg-[#f7f9f8]">
+        <div className="w-full max-w-xl rounded-xl border border-gray-200 bg-white p-6 shadow-sm">
+          <h1 className="text-2xl text-black font-semibold">{presetLabel} Intake</h1>
+          <p className="text-sm text-gray-600 mt-2">
+            Press connect to start your live assistant session.
+          </p>
+          {showMicrophoneAccessMessage && (
+            <p className="text-sm text-red-600 mt-4">Please enable microphone access to continue.</p>
+          )}
+          <div className="mt-6">
+            <Button className="w-full text-base" onClick={async () => await startConnection()}>
+              Connect
+            </Button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="text-center h-screen w-screen p-4 flex flex-col items-center pt-8">
       <div className="mb-6">
@@ -113,36 +139,43 @@ const Homepage = ({
               </option>
             ))}
           </select>
-      </div>
+        </div>
 
         {showMicrophoneAccessMessage && (
           <p className="text-center text-red-500">Please enable your microphone before proceeding</p>
         )}
-        
+
         <Button onClick={async () => await startConnection()}>Connect</Button>
-    </div>
+      </div>
     </div>
   );
-}
+};
 
-export const Queue:FC = () => {
-  const theme = "light" as const;  // Always use light theme
+export const Queue: FC = () => {
+  const theme = "light" as const;
   const [searchParams] = useSearchParams();
   const overrideWorkerAddr = searchParams.get("worker_addr");
+  const isEmbed = searchParams.get("embed") === "1";
+  const contractorId = searchParams.get("contractor_id");
+  const contractorPreset = useMemo(() => getContractorPreset(contractorId), [contractorId]);
+
   const [hasMicrophoneAccess, setHasMicrophoneAccess] = useState<boolean>(false);
   const [showMicrophoneAccessMessage, setShowMicrophoneAccessMessage] = useState<boolean>(false);
-  const modelParams = useModelParams();
+  const modelParams = useModelParams({
+    textPrompt: contractorPreset.textPrompt,
+    voicePrompt: contractorPreset.voicePrompt,
+  });
+  const { setTextPrompt, setVoicePrompt } = modelParams;
 
   const audioContext = useRef<AudioContext | null>(null);
   const worklet = useRef<AudioWorkletNode | null>(null);
-  
-  // enable eruda in development
+
   useEffect(() => {
-    if(env.VITE_ENV === "development") {
+    if (env.VITE_ENV === "development") {
       eruda.init();
     }
-    () => {
-      if(env.VITE_ENV === "development") {
+    return () => {
+      if (env.VITE_ENV === "development") {
         eruda.destroy();
       }
     };
@@ -153,53 +186,64 @@ export const Queue:FC = () => {
       await window.navigator.mediaDevices.getUserMedia({ audio: true });
       setHasMicrophoneAccess(true);
       return true;
-    } catch(e) {
+    } catch (e) {
       console.error(e);
       setShowMicrophoneAccessMessage(true);
       setHasMicrophoneAccess(false);
     }
     return false;
-}, [setHasMicrophoneAccess, setShowMicrophoneAccessMessage]);
+  }, [setHasMicrophoneAccess, setShowMicrophoneAccessMessage]);
 
   const startProcessor = useCallback(async () => {
-    if(!audioContext.current) {
+    if (!audioContext.current) {
       audioContext.current = new AudioContext();
-      // Prewarm decoder worker as soon as we have audio context
-      // This gives WASM time to load while user grants mic access
       prewarmDecoderWorker(audioContext.current.sampleRate);
     }
-    if(worklet.current) {
+    if (worklet.current) {
       return;
     }
-    let ctx = audioContext.current;
+    const ctx = audioContext.current;
     ctx.resume();
     try {
-      worklet.current = new AudioWorkletNode(ctx, 'moshi-processor');
-    } catch (err) {
+      worklet.current = new AudioWorkletNode(ctx, "moshi-processor");
+    } catch {
       await ctx.audioWorklet.addModule(moshiProcessorUrl);
-      worklet.current = new AudioWorkletNode(ctx, 'moshi-processor');
+      worklet.current = new AudioWorkletNode(ctx, "moshi-processor");
     }
     worklet.current.connect(ctx.destination);
   }, [audioContext, worklet]);
 
-  const startConnection = useCallback(async() => {
-      await startProcessor();
-      const hasAccess = await getMicrophoneAccess();
-      if (hasAccess) {
-      // Values are already set in modelParams, they get passed to Conversation
+  const startConnection = useCallback(async () => {
+    if (isEmbed) {
+      setTextPrompt(contractorPreset.textPrompt);
+      setVoicePrompt(contractorPreset.voicePrompt);
     }
-  }, [startProcessor, getMicrophoneAccess]);
+    await startProcessor();
+    await getMicrophoneAccess();
+  }, [
+    contractorPreset.textPrompt,
+    contractorPreset.voicePrompt,
+    getMicrophoneAccess,
+    isEmbed,
+    setTextPrompt,
+    setVoicePrompt,
+    startProcessor,
+  ]);
 
   return (
     <>
       {(hasMicrophoneAccess && audioContext.current && worklet.current) ? (
         <Conversation
-        workerAddr={overrideWorkerAddr ?? ""}
-        audioContext={audioContext as MutableRefObject<AudioContext|null>}
-        worklet={worklet as MutableRefObject<AudioWorkletNode|null>}
-        theme={theme}
-        startConnection={startConnection}
-        {...modelParams}
+          workerAddr={overrideWorkerAddr ?? ""}
+          contractorId={contractorPreset.contractorId}
+          contractorLabel={contractorPreset.label}
+          leadApiBasePath={env.VITE_QUEUE_API_PATH}
+          embed={isEmbed}
+          audioContext={audioContext as MutableRefObject<AudioContext | null>}
+          worklet={worklet as MutableRefObject<AudioWorkletNode | null>}
+          theme={theme}
+          startConnection={startConnection}
+          {...modelParams}
         />
       ) : (
         <Homepage
@@ -209,6 +253,8 @@ export const Queue:FC = () => {
           setTextPrompt={modelParams.setTextPrompt}
           voicePrompt={modelParams.voicePrompt}
           setVoicePrompt={modelParams.setVoicePrompt}
+          isEmbed={isEmbed}
+          presetLabel={contractorPreset.label}
         />
       )}
     </>

@@ -66,6 +66,22 @@ Access the Web UI from a browser at `localhost:8998` if running locally, otherwi
 Access the Web UI directly at https://11.54.401.33:8998
 ```
 
+### Lead Forwarding Endpoint
+The server now exposes `POST /api/lead` for sending qualified lead payloads (contact + transcript) to contractor destinations.
+
+Configure destinations using `PERSONAPLEX_LEAD_DESTINATIONS` as JSON:
+```bash
+export PERSONAPLEX_LEAD_DESTINATIONS='{
+  "decking_north": {"webhook_url": "https://your-crm.example.com/personaplex"},
+  "default": {"webhook_url": "https://your-crm.example.com/personaplex-default"}
+}'
+```
+
+Optional flags:
+- `--max-text-prompt-tokens` (default `200`) truncates incoming system prompts.
+- `--lead-log-path` (default `personaplex_leads.jsonl`) controls local append-only lead logging.
+- `--lead-forward-timeout` (default `8.0`) controls webhook timeout.
+
 ### Offline Evaluation
 
 For offline evaluation use the offline script that streams in an input wav file and produces an output wav file from the captured output stream. The output file will be the same duration as the input file.
