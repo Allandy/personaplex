@@ -18,7 +18,8 @@ For example : `https://localhost:5173/?worker_addr=0.0.0.0:8088`
 ## Iframe Embed Mode
 Use iframe mode for a simplified contractor intake flow:
 
-- URL: `/?embed=1&contractor_id=decking_north&worker_addr={WORKER_ADDR}`
+- URL: `/?contractor_id=decking_north&worker_addr={WORKER_ADDR}` (embed UI is now the default)
+- Optional: `?embed=1` forces embed UI, `?embed=0` forces full configuration UI.
 - `embed=1` hides advanced controls and shows a single **Connect** entry point.
 - `contractor_id` applies a preconfigured contractor prompt and voice preset.
 

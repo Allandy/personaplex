@@ -155,7 +155,8 @@ export const Queue: FC = () => {
   const theme = "light" as const;
   const [searchParams] = useSearchParams();
   const overrideWorkerAddr = searchParams.get("worker_addr");
-  const isEmbed = searchParams.get("embed") === "1";
+  const embedParam = searchParams.get("embed");
+  const isEmbed = embedParam === null ? true : embedParam === "1";
   const contractorId = searchParams.get("contractor_id");
   const contractorPreset = useMemo(() => getContractorPreset(contractorId), [contractorId]);
 
