@@ -14,7 +14,8 @@ import fixWebmDuration from "webm-duration-fix";
 import { getMimeType, getExtension } from "./getMimeType";
 import { type ThemeType } from "./hooks/useSystemTheme";
 import { WSMessage } from "../../protocol/types";
-import { getAPIClient } from "../Queue/api/client";
+import { useTranscriptSummary } from "./hooks/useTranscriptSummary";
+import { env } from "../../env";
 
 type ConversationProps = {
   workerAddr: string;
@@ -102,7 +103,6 @@ export const Conversation: FC<ConversationProps> = ({
   leadApiBasePath,
   ...params
 }) => {
-  const apiClient = useMemo(() => getAPIClient(leadApiBasePath), [leadApiBasePath]);
   const getAudioStats = useRef<() => AudioStats>(() => ({
     playedAudioDuration: 0,
     missedAudioDuration: 0,
@@ -127,6 +127,7 @@ export const Conversation: FC<ConversationProps> = ({
   const [contactMobile, setContactMobile] = useState("");
   const [contactValidationError, setContactValidationError] = useState<string | null>(null);
   const [transcriptChunks, setTranscriptChunks] = useState<string[]>([]);
+  const { summary, summaryStatus, generateSummary } = useTranscriptSummary(env.VITE_OPENAI_API_KEY);
 
   const conversationStartedAt = useRef<string | null>(null);
   const conversationEndedAt = useRef<string | null>(null);
@@ -186,6 +187,7 @@ export const Conversation: FC<ConversationProps> = ({
     setIsOver(true);
     conversationEndedAt.current = new Date().toISOString();
     stopRecording();
+    setShowLeadPrompt(true);
   }, [stopRecording]);
 
   const onSocketMessage = useCallback((message: WSMessage) => {
@@ -236,6 +238,7 @@ export const Conversation: FC<ConversationProps> = ({
   useEffect(() => {
     if (isOver && hasConnectedOnce.current && !leadSubmitted) {
       setShowLeadPrompt(true);
+      generateSummary(transcriptChunks);
     }
   }, [isOver, leadSubmitted]);
 
@@ -269,7 +272,7 @@ export const Conversation: FC<ConversationProps> = ({
       return;
     }
     if (mobileValue && !MOBILE_PATTERN.test(mobileValue.replace(/[\s()-]/g, ""))) {
-      setContactValidationError("Enter a valid mobile number in international format (for example +14155551212).");
+      setContactValidationError("Enter a valid mobile number in international format (for example +61412345678).");
       return;
     }
 
@@ -277,50 +280,15 @@ export const Conversation: FC<ConversationProps> = ({
     setLeadSubmitError(null);
     setIsLeadSubmitting(true);
 
-    const cleanMobile = mobileValue.replace(/[\s()-]/g, "");
-    const contactType: "email" | "mobile" = emailValue ? "email" : "mobile";
-    const contactValue = emailValue ? emailValue : cleanMobile;
-    const transcript =
-      transcriptChunks.join("").replace(/\s+/g, " ").trim() ||
-      "[Transcript unavailable: no model text output captured.]";
+    await new Promise((resolve) => setTimeout(resolve, 800));
 
-    const started = conversationStartedAt.current;
-    const ended = conversationEndedAt.current ?? new Date().toISOString();
-    let durationSeconds: number | null = null;
-    if (started && ended) {
-      const diffMs = Math.max(0, Date.parse(ended) - Date.parse(started));
-      durationSeconds = Math.round(diffMs / 1000);
-    }
-
-    try {
-      await apiClient.submitLead({
-        contractorId,
-        contactType,
-        contactValue,
-        transcript,
-        sessionMeta: {
-          started_at: started,
-          ended_at: ended,
-          duration_seconds: durationSeconds,
-          source_url: window.location.href,
-        },
-      });
-      setLeadSubmitted(true);
-      setShowLeadPrompt(true);
-      onConversationEnd?.();
-    } catch (error) {
-      console.error(error);
-      setLeadSubmitError("We could not submit your details right now. Please try again.");
-    } finally {
-      setIsLeadSubmitting(false);
-    }
+    setIsLeadSubmitting(false);
+    setLeadSubmitted(true);
+    onConversationEnd?.();
   }, [
-    apiClient,
     contactEmail,
     contactMobile,
-    contractorId,
     onConversationEnd,
-    transcriptChunks,
   ]);
 
   const socketColor = useMemo(() => {
@@ -360,7 +328,15 @@ export const Conversation: FC<ConversationProps> = ({
               onClick={onPressConnect}
               disabled={(socketStatus !== "connected" && !isOver) || (isOver && !leadSubmitted)}
             >
-              {socketButtonMsg}
+              <span className="flex items-center gap-2">
+                {socketStatus === "connecting" && (
+                  <svg className="animate-spin h-4 w-4 text-gray-500" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                  </svg>
+                )}
+                {socketButtonMsg}
+              </span>
             </Button>
             <div className={`h-3 w-3 rounded-full ${socketColor}`} />
           </div>
@@ -412,13 +388,36 @@ export const Conversation: FC<ConversationProps> = ({
 
       {showLeadPrompt && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/35 p-4">
-          <div className="w-full max-w-md rounded-xl border border-gray-200 bg-white p-5 shadow-lg">
+          <div className="w-full max-w-lg rounded-xl border border-gray-200 bg-white p-6 shadow-lg max-h-[90vh] overflow-y-auto">
             {!leadSubmitted ? (
               <>
-                <h2 className="text-xl font-semibold text-black">Share your contact details</h2>
-                <p className="mt-2 text-sm text-gray-600">
-                  We will send this conversation summary to {contractorLabel ?? "your contractor"} as a qualified lead.
+                <h2 className="text-xl font-semibold text-black">Conversation Summary</h2>
+
+                <div className="mt-3 min-h-[80px] rounded-lg bg-gray-50 border border-gray-200 p-4 text-sm text-gray-700">
+                  {summaryStatus === "loading" && (
+                    <div className="flex items-center gap-2 text-gray-500">
+                      <svg className="animate-spin h-4 w-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                      </svg>
+                      Generating summary...
+                    </div>
+                  )}
+                  {summaryStatus === "done" && summary && (
+                    <div dangerouslySetInnerHTML={{ __html: summary }} />
+                  )}
+                  {summaryStatus === "error" && (
+                    <p className="text-gray-500 italic">Summary unavailable.</p>
+                  )}
+                  {summaryStatus === "idle" && (
+                    <p className="text-gray-400 italic">Waiting for conversation to end...</p>
+                  )}
+                </div>
+
+                <p className="mt-4 text-sm text-gray-600">
+                  Leave your details and {contractorLabel ?? "our team"} will be in touch.
                 </p>
+
                 <div className="mt-4">
                   <label htmlFor="lead-email" className="block text-sm font-medium text-gray-700 mb-1">Email</label>
                   <input
@@ -426,7 +425,7 @@ export const Conversation: FC<ConversationProps> = ({
                     value={contactEmail}
                     onChange={(event) => setContactEmail(event.target.value)}
                     type="email"
-                    className="w-full rounded border border-gray-300 px-3 py-2 text-sm"
+                    className="w-full rounded border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-gray-400"
                     placeholder="name@example.com"
                   />
                 </div>
@@ -437,26 +436,31 @@ export const Conversation: FC<ConversationProps> = ({
                     value={contactMobile}
                     onChange={(event) => setContactMobile(event.target.value)}
                     type="tel"
-                    className="w-full rounded border border-gray-300 px-3 py-2 text-sm"
-                    placeholder="+14155551212"
+                    className="w-full rounded border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-gray-400"
+                    placeholder="+61412345678"
                   />
                 </div>
 
                 {contactValidationError && <p className="mt-3 text-sm text-red-600">{contactValidationError}</p>}
                 {leadSubmitError && <p className="mt-3 text-sm text-red-600">{leadSubmitError}</p>}
 
-                <div className="mt-5 flex gap-2">
-                  <Button className="flex-1" onClick={submitLead} disabled={isLeadSubmitting}>
-                    {isLeadSubmitting ? "Sending..." : "Send Details"}
+                <div className="mt-5">
+                  <Button className="w-full" onClick={submitLead} disabled={isLeadSubmitting}>
+                    {isLeadSubmitting ? "Submitting..." : "Submit Details"}
                   </Button>
                 </div>
               </>
             ) : (
               <>
-                <h2 className="text-xl font-semibold text-black">Details sent</h2>
-                <p className="mt-2 text-sm text-gray-600">
-                  Your transcript and contact information were sent to {contractorLabel ?? "the contractor"}.
-                </p>
+                <div className="flex flex-col items-center text-center py-4">
+                  <svg className="h-12 w-12 text-green-500 mb-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+                  </svg>
+                  <h2 className="text-xl font-semibold text-black">Thanks for your submission!</h2>
+                  <p className="mt-2 text-sm text-gray-600">
+                    Someone from {contractorLabel ?? "our team"} will be in contact with you soon.
+                  </p>
+                </div>
                 <div className="mt-5">
                   <Button className="w-full" onClick={() => window.location.reload()}>
                     Start New Conversation

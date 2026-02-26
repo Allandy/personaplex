@@ -1,6 +1,7 @@
 type ENV = {
   VITE_QUEUE_API_PATH: string;
   VITE_ENV: 'development' | 'production';
+  VITE_OPENAI_API_KEY: string | undefined;
 };
 
 const parseEnv = (): ENV => {
@@ -13,6 +14,7 @@ const parseEnv = (): ENV => {
   return {
     VITE_QUEUE_API_PATH,
     VITE_ENV: import.meta.env.DEV ? 'development' : 'production',
+    VITE_OPENAI_API_KEY: import.meta.env.VITE_OPENAI_API_KEY,
   };
 };
 
